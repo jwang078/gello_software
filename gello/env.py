@@ -77,6 +77,12 @@ class RobotEnv:
         observations["joint_velocities"] = robot_obs["joint_velocities"]
         observations["ee_pos_quat"] = robot_obs["ee_pos_quat"]
         observations["gripper_position"] = robot_obs["gripper_position"]
+        for img_key in [img_key for img_key in robot_obs.keys() if img_key.endswith("_rgb")]:
+            if img_key in robot_obs:
+                observations[img_key] = robot_obs[img_key]
+        for img_key in ["base_rgb", "wrist_rgb"]:
+            if img_key not in observations:
+                observations[img_key] = None
         return observations
 
 
