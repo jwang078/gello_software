@@ -133,16 +133,61 @@ class ZMQClientRobot(Robot):
         self._socket.send(send_message)
         result = pickle.loads(self._socket.recv())
         return result
+
+    def reset(self, seed: int | None = None, options: dict | None = None):
+        """Reset the remote environment and return (obs, info)."""
+        request = {
+            "method": "reset",
+            "args": {"seed": seed, "options": options or {}},
+        }
+        self._socket.send(pickle.dumps(request))
+        return pickle.loads(self._socket.recv())
+
+    def set_eval_benchmark_indices(self, indices):
+        """Replace the remote server's eval-benchmark playlist.
+
+        Order + duplicates preserved: e.g. indices=[2, 2, 3, 10, 10] makes
+        the next 5 reset()s return scenarios 2, 2, 3, 10, 10 in that order.
+        The server rewinds its internal counter so the very next reset()
+        lands on indices[0]. See server-side docstring for the design
+        rationale and the alternative options["benchmark_start_index"] knob.
+        """
+        request = {
+            "method": "set_eval_benchmark_indices",
+            "args": {"indices": list(indices)},
+        }
+        self._socket.send(pickle.dumps(request))
+        return pickle.loads(self._socket.recv())
+
+    def set_policy_guidance_action(self, joint_state: np.ndarray) -> None:
+        """Store a policy guidance action in the server buffer without applying it to the robot.
+
+        The server includes this as policy_guidance_action in get_observations() results,
+        allowing a policy process to observe the guidance signal.
+        """
+        request = {
+            "method": "set_policy_guidance_action",
+            "args": {"joint_state": joint_state},
+        }
+        self._socket.send(pickle.dumps(request))
+        self._socket.recv()  # drain reply
     
-    def teleport_joint_state(self, joint_state: np.ndarray) -> None:
+    def teleport_joint_state(self, joint_state: np.ndarray, joint_velocities=None) -> None:
         """Command the leader robot to the given state.
 
         Args:
             joint_state (T): The state to command the leader robot to.
+            joint_velocities: optional per-joint velocities (rad/s) restored
+                with the position, so a rewind teleport lands MOVING instead
+                of at rest. Omitted from the request when None so older
+                servers keep working.
         """
+        args = {"joint_state": joint_state}
+        if joint_velocities is not None:
+            args["joint_velocities"] = joint_velocities
         request = {
             "method": "teleport_joint_state",
-            "args": {"joint_state": joint_state},
+            "args": args,
         }
         send_message = pickle.dumps(request)
         self._socket.send(send_message)
@@ -228,13 +273,45 @@ class ZMQClientRobot(Robot):
         result = pickle.loads(self._socket.recv())
         return result
 
-    def get_observations(self) -> Dict[str, np.ndarray]:
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get task metrics from the server (sim only).
+
+        Returns a metrics dict with at least {"is_success": bool, "terminated": bool}.
+        Falls back to a default dict if the server doesn't support check_metrics.
+        """
+        request = {"method": "check_metrics"}
+        try:
+            self._socket.send(pickle.dumps(request))
+            result = pickle.loads(self._socket.recv())
+            if isinstance(result, dict) and "error" in result:
+                return {"is_success": False}
+            return result
+        except Exception:
+            return {"is_success": False}
+
+    def get_env_config(self) -> Dict[str, Any]:
+        """Fetch the server's serialized ENV_CONFIG (objects + task goal).
+
+        Used by clients that need obstacle geometry for planning (e.g. RRT-to-goal
+        in lerobot's shared autonomy wrapper).
+        """
+        request = {"method": "get_env_config"}
+        try:
+            self._socket.send(pickle.dumps(request))
+            result = pickle.loads(self._socket.recv())
+            if isinstance(result, dict) and "error" in result:
+                raise RuntimeError(result["error"])
+            return result
+        except zmq.Again:
+            raise RuntimeError("ZMQ timeout - robot may be disconnected")
+
+    def get_observations(self, render_images: bool = True) -> Dict[str, np.ndarray]:
         """Get the current observations of the leader robot.
 
         Returns:
             Dict[str, np.ndarray]: The current observations of the leader robot.
         """
-        request = {"method": "get_observations"}
+        request = {"method": "get_observations", "args": {"render_images": render_images}}
         send_message = pickle.dumps(request)
         try:
             self._socket.send(send_message)
@@ -245,6 +322,18 @@ class ZMQClientRobot(Robot):
         except zmq.Again:
             raise RuntimeError("ZMQ timeout - robot may be disconnected")
         
+    def get_gym_observations(self) -> Dict[str, Any]:
+        """Get observations in gym format (agent_pos + pixels dict)."""
+        request = {"method": "get_gym_observations"}
+        try:
+            self._socket.send(pickle.dumps(request))
+            result = pickle.loads(self._socket.recv())
+            if isinstance(result, dict) and "error" in result:
+                raise RuntimeError(result["error"])
+            return result
+        except zmq.Again:
+            raise RuntimeError("ZMQ timeout - robot may be disconnected")
+
     def disable_rendering(self) -> Dict[str, np.ndarray]:
         """Disable rendering from splat
 
